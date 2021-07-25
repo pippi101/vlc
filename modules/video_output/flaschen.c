@@ -43,6 +43,13 @@
 #include <vlc_plugin.h>
 #include <vlc_vout_display.h>
 
+struct flaschen_offset_t {
+    int x;
+    int y;
+    int z;  /* aka. layer */
+};
+static struct flaschen_offset_t flaschen_offset_from_flag;
+
 #define T_FLDISPLAY N_("Flaschen-Taschen display address")
 #define LT_FLDISPLAY N_( \
     "IP address or hostname of the Flaschen-Taschen display. " \
@@ -53,6 +60,10 @@
 
 #define T_HEIGHT N_("Height")
 #define LT_HEIGHT NULL
+
+#define T_OFFSET N_("Offset")
+#define LT_OFFSET N_("Comma separated x,y,z offset. Z also known as layer. " \
+                     "Just providing only x or x,y allowed.")
 
 static int Open(vout_display_t *vd,
                 video_format_t *fmtp, vlc_video_context *context);
@@ -69,6 +80,7 @@ vlc_module_begin ()
     add_string( "flaschen-display", NULL, T_FLDISPLAY, LT_FLDISPLAY )
     add_integer("flaschen-width", 25, T_WIDTH, LT_WIDTH)
     add_integer("flaschen-height", 20, T_HEIGHT, LT_HEIGHT)
+    add_string("flaschen-offset", "0,0,0", T_OFFSET, LT_OFFSET)
 vlc_module_end ()
 
 
@@ -115,6 +127,21 @@ static int Open(vout_display_t *vd,
     fmt.i_visible_height = fmt.i_height;
 
     /* p_vd->info is not modified */
+
+    memset(&flaschen_offset_from_flag, 0, sizeof(flaschen_offset_from_flag));
+    char *offset = var_InheritString(vd, "flaschen-offset");
+    if (offset)
+    {
+        if (sscanf(offset, "%d,%d,%d",
+                   &flaschen_offset_from_flag.x,
+                   &flaschen_offset_from_flag.y,
+                   &flaschen_offset_from_flag.z) < 1)
+         {
+            msg_Warn(vd, "At least x value required for flaschen-offset.");
+            /* non critical, continue */
+         }
+         free(offset);
+    }
 
     char *display = var_InheritString(vd, "flaschen-display");
     if (display == NULL) {
@@ -165,48 +192,67 @@ static void Display(vout_display_t *vd, picture_t *picture)
 #else
     const long iovmax = sysconf(_SC_IOV_MAX);
 #endif
-    vout_display_sys_t *sys = vd->sys;
-    video_format_t *fmt = &picture->format;
-    int result;
+    const vout_display_sys_t *sys = vd->sys;
+    const video_format_t *fmt = &picture->format;
 
-    char buffer[64];
-    int header_len = snprintf(buffer, sizeof(buffer), "P6\n%d %d\n255\n",
-                              fmt->i_width, fmt->i_height);
-    /* TODO: support offset_{x,y,z}? (#FT:...) */
-    /* Note the protocol doesn't include any picture order field. */
-    /* (maybe add as comment?) */
+    /* Local offset copy needed to modify when tiling large frames */
+    struct flaschen_offset_t offset = flaschen_offset_from_flag;
 
-    int iovcnt = 1 + fmt->i_height;
-    if (unlikely(iovcnt > iovmax))
-        return;
+    /* For a huge display, the full frame might not fit in one UDP packet.
+     * So we send it in horizontal strips that each fit.
+     */
+    const int kMaxDataLen = 65507 - 64;  /* Leave some space for header */
+    const size_t row_size = fmt->i_width * 3;
+    const int max_send_height = kMaxDataLen / row_size;
 
-    struct iovec iov[iovcnt];
-    iov[0].iov_base = buffer;
-    iov[0].iov_len = header_len;
-
-    uint8_t *src = picture->p->p_pixels;
-    for (int i = 1; i < iovcnt; i++)
+    char header_buffer[64];
+    uint8_t *picture_buffer = picture->p->p_pixels;
+    int rows = fmt->i_height;
+    while (rows)
     {
-        iov[i].iov_base = src;
-        iov[i].iov_len = fmt->i_width * 3;
-        src += picture->p->i_pitch;
-    }
+        /* send only as many rows at a time that fit into a packet */
+        const int send_h = (rows < max_send_height) ? rows : max_send_height;
+        int header_len = snprintf(header_buffer, sizeof(header_buffer),
+                                  "P6\n%d %d\n#FT: %d %d %d\n255\n",
+                                  fmt->i_width, send_h,
+                                  offset.x, offset.y, offset.z);
+        /* Note the protocol doesn't include any picture order field. */
+        /* (maybe add as comment?) */
 
-    struct msghdr hdr = {
-        .msg_name = NULL,
-        .msg_namelen = 0,
-        .msg_iov = iov,
-        .msg_iovlen = iovcnt,
-        .msg_control = NULL,
-        .msg_controllen = 0,
-        .msg_flags = 0 };
+        int iovcnt = 1 + send_h;
+        if (unlikely(iovcnt > iovmax))
+            return;
 
-    result = sendmsg(sys->fd, &hdr, 0);
-    if (result < 0)
-        msg_Err(vd, "sendmsg: error %s in vout display flaschen", vlc_strerror_c(errno));
-    else if (result < (int)(header_len + fmt->i_width * fmt->i_height * 3))
-        msg_Err(vd, "sendmsg only sent %d bytes in vout display flaschen", result);
+        struct iovec iov[iovcnt];
+        iov[0].iov_base = header_buffer;
+        iov[0].iov_len = header_len;
+
+        for (int i = 1; i < iovcnt; i++)
+        {
+            iov[i].iov_base = picture_buffer;
+            iov[i].iov_len = row_size;
+            picture_buffer += picture->p->i_pitch;
+        }
+
+        struct msghdr hdr = {
+            .msg_name = NULL,
+            .msg_namelen = 0,
+            .msg_iov = iov,
+            .msg_iovlen = iovcnt,
+            .msg_control = NULL,
+            .msg_controllen = 0,
+            .msg_flags = 0 };
+
+        int result = sendmsg(sys->fd, &hdr, 0);
+        if (result < 0)
+            msg_Err(vd, "sendmsg: error %s in vout display flaschen", vlc_strerror_c(errno));
+        else if (result < (int)(header_len + fmt->i_width * send_h * 3))
+            msg_Err(vd, "sendmsg only sent %d bytes in vout display flaschen", result);
+
+        rows -= send_h;
+        offset.y += send_h;
         /* we might want to drop some frames? */
+    }
 }
 
 /**
